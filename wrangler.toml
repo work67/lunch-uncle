@@ -12,3 +12,11 @@ fallthrough = false
 # LLM_BASE_URL, LLM_MODEL) are set with
 # `wrangler secret put` for deploys and `.env` for local development.
 # Never put them in this file.
+
+# Per-IP rate limit for POST /chat, so a public URL cannot burn the API keys.
+# namespace_id is any integer, but it must be unique to this Worker within the
+# Cloudflare account, or two Workers will share one counter.
+[[ratelimits]]
+name = "CHAT_LIMITER"
+namespace_id = "4201"
+simple = { limit = 10, period = 60 }

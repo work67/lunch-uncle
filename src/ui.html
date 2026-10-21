@@ -36,7 +36,7 @@
   <div id="chat"></div>
 
   <form id="form">
-    <input id="input" placeholder="Uncle, where to eat?" autocomplete="off" autofocus>
+    <input id="input" placeholder="Uncle, where to eat?" autocomplete="off" maxlength="500" autofocus>
     <button id="send" type="submit">Send</button>
   </form>
 
@@ -47,7 +47,11 @@
     const send = document.getElementById("send");
 
     // Conversation so far, in the shape the /chat endpoint expects.
+    // The server only uses the most recent messages, so keep the same number.
     const history = [];
+    const MAX_HISTORY = 12;
+    // One id per conversation, so the LLM provider can reuse its cache across turns.
+    const sessionId = crypto.randomUUID();
 
     function addBubble(role, text) {
       const div = document.createElement("div");
@@ -72,13 +76,18 @@
         const res = await fetch("/chat", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ history, message }),
+          body: JSON.stringify({ history, message, session_id: sessionId }),
         });
         const data = await res.json();
-        const reply = data.reply ?? data.error ?? "No reply.";
-        thinking.textContent = reply;
+        if (!res.ok || typeof data.reply !== "string") {
+          // Show the error, but keep it out of history so Uncle never "said" it.
+          thinking.textContent = data.error ?? "Uncle cannot think right now, try again later.";
+          return;
+        }
+        thinking.textContent = data.reply;
         history.push({ role: "user", content: message });
-        history.push({ role: "assistant", content: reply });
+        history.push({ role: "assistant", content: data.reply });
+        history.splice(0, Math.max(0, history.length - MAX_HISTORY));
       } catch (err) {
         thinking.textContent = "Cannot reach Uncle. Try again.";
       } finally {
