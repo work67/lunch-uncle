@@ -1,10 +1,6 @@
 import { buildSystemPrompt } from "./prompt.js";
 import { toolDefinitions, executeTool } from "./tools.js";
 
-// TODO: set the base URL and model for your OpenAI-compatible provider.
-const LLM_BASE_URL = "TODO";
-const LLM_MODEL = "TODO";
-
 const LLM_TIMEOUT_MS = 20_000;
 const MAX_ROUNDS = 8;
 
@@ -58,7 +54,12 @@ export async function runLoop(history, message, env) {
 }
 
 async function callModel(messages, env, sessionId) {
-  const res = await fetch(`${LLM_BASE_URL}/chat/completions`, {
+  // The OpenAI-compatible endpoint and model come from env (LLM_BASE_URL, LLM_MODEL).
+  if (!env.LLM_BASE_URL || !env.LLM_MODEL) {
+    throw new Error("LLM_BASE_URL and LLM_MODEL must be set in env");
+  }
+
+  const res = await fetch(`${env.LLM_BASE_URL}/chat/completions`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -66,7 +67,7 @@ async function callModel(messages, env, sessionId) {
       "x-opencode-session": sessionId,
     },
     body: JSON.stringify({
-      model: LLM_MODEL,
+      model: env.LLM_MODEL,
       messages,
       tools: toolDefinitions,
     }),
