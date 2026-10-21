@@ -6,12 +6,28 @@
  * The format functions are the ones covered by tests.
  */
 
-// CT Hub 2, 114 Lavender Street.
-export const CT_HUB_2 = { latitude: 1.3115, longitude: 103.8615 };
+// CT Hub 2, 114 Lavender Street (OneMap geocode for postcode 338729).
+export const CT_HUB_2 = { latitude: 1.311588, longitude: 103.863375 };
+
+// Bus stops within a short walk of CT Hub 2, nearest first (busrouter.sg stop data).
+export const NEARBY_BUS_STOPS = [
+  { code: "07369", name: "Aft Kallang Bahru", distance_m: 112 },
+  { code: "07379", name: "Aperia/Bef Kallang Rd", distance_m: 158 },
+  { code: "07361", name: "Bef Kallang Bahru", distance_m: 165 },
+];
 
 const SEARCH_RADIUS_METRES = 800;
+// The search radius is only a bias, so results further than this are dropped.
+export const MAX_WALK_METRES = 1000;
 const MAX_PLACES = 10;
 const FORECAST_AREA = "Kallang";
+const DEFAULT_STOP_CODE = NEARBY_BUS_STOPS[0].code;
+
+const TOOL_TIMEOUT_MS = 8_000;
+const PLACES_CACHE_MS = 10 * 60_000;
+const FORECAST_CACHE_MS = 5 * 60_000;
+// arrivelah reports a bus at the stop as slightly negative; past this it has left.
+const DEPARTED_MS = -60_000;
 
 const PLACES_URL = "https://places.googleapis.com/v1/places:searchText";
 const FORECAST_URL =
@@ -28,7 +44,7 @@ export const toolDefinitions = [
     function: {
       name: "find_lunch_places",
       description:
-        "Search for places to eat near CT Hub 2. Returns name, rating, distance and whether it is open now.",
+        "Search for places to eat within walking distance of CT Hub 2, nearest first. Returns name, rating, distance in metres, and open_now (true, false, or null if unknown).",
       parameters: {
         type: "object",
         properties: {
@@ -59,17 +75,19 @@ export const toolDefinitions = [
     type: "function",
     function: {
       name: "get_bus_arrivals",
-      description:
-        "Get the next bus arrivals at a Singapore bus stop, by five-digit stop code.",
+      description: `Get the next bus arrivals at a Singapore bus stop. Defaults to ${DEFAULT_STOP_CODE} (${NEARBY_BUS_STOPS[0].name}), the stop nearest CT Hub 2.`,
       parameters: {
         type: "object",
         properties: {
           stop_code: {
             type: "string",
-            description: 'Five-digit bus stop code, e.g. "07371".',
+            description: `Five-digit bus stop code, e.g. "${DEFAULT_STOP_CODE}". Leave out to use the stop nearest CT Hub 2.`,
+          },
+          service: {
+            type: "string",
+            description: 'Only return this bus service, e.g. "13".',
           },
         },
-        required: ["stop_code"],
       },
     },
   },
@@ -81,18 +99,58 @@ export const toolDefinitions = [
 
 /**
  * Run one tool call requested by the model and return the result as a string.
+ * Failures come back as {error} so the model can still answer.
  */
 export async function executeTool(name, args, env) {
+  try {
+    return JSON.stringify(await runTool(name, args, env));
+  } catch (err) {
+    console.error(`tool ${name} failed:`, err);
+    const reason = err?.name === "TimeoutError" ? "timed out" : err?.message;
+    return JSON.stringify({ error: `${name} failed: ${reason}` });
+  }
+}
+
+function runTool(name, args, env) {
   switch (name) {
     case "find_lunch_places":
-      return JSON.stringify(await findLunchPlaces(args, env));
+      return findLunchPlaces(args, env);
     case "get_rain_forecast":
-      return JSON.stringify(await getRainForecast());
+      return getRainForecast();
     case "get_bus_arrivals":
-      return JSON.stringify(await getBusArrivals(args));
+      return getBusArrivals(args);
     default:
-      return JSON.stringify({ error: `Unknown tool: ${name}` });
+      return { error: `Unknown tool: ${name}` };
   }
+}
+
+async function fetchJson(url, init = {}) {
+  const res = await fetch(url, {
+    ...init,
+    signal: AbortSignal.timeout(TOOL_TIMEOUT_MS),
+  });
+  if (!res.ok) {
+    throw new Error(`${new URL(url).hostname} returned ${res.status}`);
+  }
+  return res.json();
+}
+
+// Results shared across requests in the same isolate, so repeat questions
+// skip the paid Places call and the forecast fetch.
+const cache = new Map();
+const MAX_CACHE_ENTRIES = 100;
+
+async function cached(key, ttlMs, load) {
+  const hit = cache.get(key);
+  if (hit && hit.expires > Date.now()) {
+    return hit.value;
+  }
+  const value = await load();
+  if (cache.size >= MAX_CACHE_ENTRIES) {
+    cache.delete(cache.keys().next().value);
+  }
+  cache.set(key, { value, expires: Date.now() + ttlMs });
+  return value;
 }
 
 // ---------------------------------------------------------------------------
@@ -100,46 +158,64 @@ export async function executeTool(name, args, env) {
 // ---------------------------------------------------------------------------
 
 async function findLunchPlaces({ query, open_now = false }, env) {
-  const centre = CT_HUB_2;
-
-  const body = {
-    textQuery: query,
-    includedType: "restaurant",
-    openNow: open_now,
-    pageSize: MAX_PLACES,
-    locationBias: {
-      circle: { center: centre, radius: SEARCH_RADIUS_METRES },
-    },
-  };
-
-  const res = await fetch(PLACES_URL, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "X-Goog-Api-Key": env.GOOGLE_PLACES_API_KEY,
-      "X-Goog-FieldMask":
-        "places.id,places.displayName,places.location,places.rating,places.currentOpeningHours",
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!res.ok) {
-    return { error: `Places API returned ${res.status}` };
+  if (typeof query !== "string" || query.trim() === "") {
+    return { error: "query is required" };
+  }
+  if (!env.GOOGLE_PLACES_API_KEY) {
+    console.warn("GOOGLE_PLACES_API_KEY is not set");
+    return { error: "Places search is not set up, cannot look up places" };
   }
 
-  const data = await res.json();
-  return { places: formatPlaces(data.places ?? [], centre) };
+  const textQuery = query.trim();
+  const openNow = open_now === true;
+  const key = `places:${openNow}:${textQuery.toLowerCase()}`;
+
+  return cached(key, PLACES_CACHE_MS, async () => {
+    const data = await fetchJson(PLACES_URL, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "X-Goog-Api-Key": env.GOOGLE_PLACES_API_KEY,
+        "X-Goog-FieldMask":
+          "places.displayName,places.location,places.rating,places.currentOpeningHours",
+      },
+      body: JSON.stringify({
+        textQuery,
+        openNow,
+        pageSize: MAX_PLACES,
+        locationBias: {
+          circle: { center: CT_HUB_2, radius: SEARCH_RADIUS_METRES },
+        },
+      }),
+    });
+
+    const places = formatPlaces(data.places ?? [], CT_HUB_2);
+    if (places.length === 0) {
+      return { places, note: "Nothing within walking distance for that search." };
+    }
+    return { places };
+  });
 }
 
 /**
- * Shape Places API results into the fields Uncle needs.
+ * Shape Places API results into the fields Uncle needs, nearest first,
+ * dropping places without a location or beyond walking distance.
  */
-export function formatPlaces(places, origin) {
-  return places.map(({ displayName, rating, location }) => ({
-    name: displayName?.text ?? "Unnamed",
-    rating: rating ?? null,
-    distance_m: Math.round(haversineMetres(origin, location)),
-  }));
+export function formatPlaces(places, origin, maxMetres = MAX_WALK_METRES) {
+  return places
+    .filter(
+      ({ location }) =>
+        Number.isFinite(location?.latitude) &&
+        Number.isFinite(location?.longitude),
+    )
+    .map(({ displayName, rating, location, currentOpeningHours }) => ({
+      name: displayName?.text ?? "Unnamed",
+      rating: rating ?? null,
+      distance_m: Math.round(haversineMetres(origin, location)),
+      open_now: currentOpeningHours?.openNow ?? null,
+    }))
+    .filter((place) => place.distance_m <= maxMetres)
+    .sort((a, b) => a.distance_m - b.distance_m);
 }
 
 /**
@@ -163,48 +239,67 @@ export function haversineMetres(a, b) {
 // ---------------------------------------------------------------------------
 
 async function getRainForecast() {
-  const res = await fetch(FORECAST_URL);
-  if (!res.ok) {
-    return { error: `Forecast API returned ${res.status}` };
-  }
-  return formatForecast(await res.json(), FORECAST_AREA);
+  const payload = await cached("forecast", FORECAST_CACHE_MS, () =>
+    fetchJson(FORECAST_URL),
+  );
+  return formatForecast(payload, FORECAST_AREA, new Date());
 }
 
 /**
- * Pull one area's forecast out of the data.gov.sg two-hour forecast payload.
+ * Pull one area's forecast out of the data.gov.sg two-hour forecast payload,
+ * flagging it if its period has already ended.
  */
-export function formatForecast(payload, area) {
+export function formatForecast(payload, area, now = new Date()) {
   const item = payload?.data?.items?.[0];
   if (!item) {
     return { error: "No forecast available" };
   }
-  const entry = item.forecasts.find((f) => f.area === area);
-  return {
+  const wanted = area.toLowerCase();
+  const entry = item.forecasts?.find((f) => f.area?.toLowerCase() === wanted);
+  if (!entry) {
+    return { error: `No forecast for ${area} right now` };
+  }
+
+  const result = {
     area,
-    forecast: entry?.forecast ?? "Unknown",
+    forecast: entry.forecast,
     valid_period: item.valid_period?.text ?? null,
   };
+  const end = Date.parse(item.valid_period?.end);
+  if (Number.isFinite(end) && end < now.getTime()) {
+    return {
+      ...result,
+      stale: true,
+      note: "This forecast period has already ended, so treat it as a rough guide.",
+    };
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------
 // get_bus_arrivals
 // ---------------------------------------------------------------------------
 
-async function getBusArrivals({ stop_code }) {
-  const url = `${BUS_URL}?id=${encodeURIComponent(stop_code)}`;
-  const res = await fetch(url);
-  if (!res.ok) {
-    return { error: `Bus API returned ${res.status}` };
+async function getBusArrivals({ stop_code, service }) {
+  const stopCode = stop_code ? String(stop_code).trim() : DEFAULT_STOP_CODE;
+  if (!/^\d{5}$/.test(stopCode)) {
+    return { error: "stop_code must be a five-digit bus stop code" };
   }
-  return formatBusArrivals(await res.json(), stop_code);
+  const payload = await fetchJson(`${BUS_URL}?id=${stopCode}`);
+  return formatBusArrivals(payload, stopCode, service);
 }
 
 /**
- * Reduce an arrivelah response to service numbers and minutes to arrival.
+ * Reduce an arrivelah response to service numbers and minutes to arrival,
+ * optionally keeping only one service.
  */
-export function formatBusArrivals(payload, stopCode) {
-  const services = payload?.services ?? [];
-  return {
+export function formatBusArrivals(payload, stopCode, service) {
+  const wanted = service ? String(service).trim().toUpperCase() : null;
+  const services = (payload?.services ?? []).filter(
+    (s) => !wanted || String(s.no).toUpperCase() === wanted,
+  );
+
+  const result = {
     stop_code: stopCode,
     services: services.map((s) => ({
       service: s.no,
@@ -212,11 +307,19 @@ export function formatBusArrivals(payload, stopCode) {
       subsequent_min: minutesFromNow(s.subsequent),
     })),
   };
+  if (wanted && services.length === 0) {
+    result.note = `No arrivals for bus ${wanted} at this stop right now.`;
+  }
+  return result;
 }
 
 function minutesFromNow(arrival) {
-  if (!arrival || typeof arrival.duration_ms !== "number") {
+  if (arrival?.duration_ms == null) {
     return null;
   }
-  return Math.max(0, Math.round(arrival.duration_ms / 60000));
+  const ms = Number(arrival.duration_ms);
+  if (!Number.isFinite(ms) || ms < DEPARTED_MS) {
+    return null;
+  }
+  return Math.max(0, Math.round(ms / 60000));
 }
