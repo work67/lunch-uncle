@@ -41,8 +41,10 @@ sequenceDiagram
    ```
    OPENCODE_API_KEY=your-key-here
    GOOGLE_PLACES_API_KEY=your-key-here
+   LLM_BASE_URL=https://opencode.ai/inference/go/openai/v1
+   LLM_MODEL=glm-5.3-flash
    ```
-4. Fill in the two `TODO` constants at the top of `src/loop.js`: `LLM_BASE_URL` and `LLM_MODEL`, for the OpenCode Go endpoint and model. The Go endpoint requires an `x-opencode-session` header, which `callModel` already sends.
+4. `LLM_BASE_URL` and `LLM_MODEL` set the OpenCode Go endpoint and model, and `.env.example` already has working values. To try another model, change `LLM_MODEL`. The Go endpoint requires an `x-opencode-session` header, which `callModel` already sends.
 5. Start the dev server:
    ```sh
    npm run dev
@@ -52,6 +54,8 @@ sequenceDiagram
    ```sh
    wrangler secret put OPENCODE_API_KEY
    wrangler secret put GOOGLE_PLACES_API_KEY
+   wrangler secret put LLM_BASE_URL
+   wrangler secret put LLM_MODEL
    npm run deploy
    ```
 
